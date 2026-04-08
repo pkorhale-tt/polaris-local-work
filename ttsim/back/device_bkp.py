@@ -314,7 +314,7 @@ class Device:
                 logger.info(f"using predictor for {opname}: msecs={tt_stats.msecs}")
                 return (tt_stats.msecs, True, tt_stats)
             else:
-                logger.info(f"predictor returned None for {opname}, using generic model (fallback to lookup table model)")
+                logger.info(f"predictor returned None for {opname}, using generic model")
         except Exception as e:
             import traceback
             logger.warning(f"tt_matmul_predictor failed for {opname}: {e}")
