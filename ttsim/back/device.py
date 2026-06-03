@@ -306,10 +306,11 @@ class Device:
         # except Exception as e:
         #     logger.warning(f"tt_matmul_predictor failed for {opname}: {e}")
         # ── end matmul pipeline ────────────────────────────────────────────────
+    
         try:
             from tools.perf_lookup.tt_matmul_predictor import predict_matmul_msecs
             tt_stats = predict_matmul_msecs(op, wlgraph, freq_MHz=self.freq_MHz)
-            logger.info(f"tt_matmul_predictor result: {tt_stats}")  # ← move here BEFORE return
+            logger.info(f"tt_matmul_predictor result: {tt_stats}") 
             if tt_stats is not None:
                 logger.info(f"using predictor for {opname}: msecs={tt_stats.msecs}")
                 return (tt_stats.msecs, True, tt_stats)
@@ -321,7 +322,7 @@ class Device:
             logger.warning(traceback.format_exc())  # ← print full stack trace
         # ── end matmul pipeline ────────────────────────────────────────────────
 
-
+        
 
         if self.operator_perf_map is not None:
             try:

@@ -312,3 +312,30 @@ workloads:
     instances:
       vit_b16: { bs: 1, model_name: vit-b16 }
       vit_base_224x224: { bs: 1, model_name: vit-b16 }
+
+
+  - api: TTNN
+    name: Matmul2Tensors
+    basedir: workloads/ttnn/Matmultest
+    module: run_matmul_test@ttnn_functional_matmul.py
+    instances:
+      sweep_32_to_4096:
+        bs: 1
+        sizes: "32,64,128,256,512,1024,2048,4096"
+        dtype: bf16
+        fidelity: HiFi4
+        num_runs: 1
+
+  - api: TTNN
+    name: Matmul2Tensors_1
+    basedir: workloads/ttnn/Matmultest
+    module: run_matmul_test@ttnn_functional_workload_1.py
+    instances:
+      sweep_32_to_4096_bf16:
+        bs: 1
+        min_size: 32
+        max_size: 4096
+        step: 32
+        dtype: bf16
+        fidelity: HIFI4
+        num_runs: 1

@@ -1,0 +1,168 @@
+================================================================================
+POLARIS – CORE (ANALYTICAL / FIRST-PRINCIPLES) KERNEL DEVICE-TIME MODEL
+(How Polaris computes per-op kernel time WITHOUT the lookup table and
+WITHOUT step3_predict_time / tt_matmul_predictor)
+================================================================================
+
+Source file : ttsim/back/device.py
+Key methods : execute_op()      -> computes per-op cycle counts
+              get_exec_stats()  -> turns cycle counts into kernel time
+
+The "core" model is a classic ROOF-LINE: for each op, compute two independent
+cycle costs (compute-bound and memory-bound), take the MAX (compute and memory
+are assumed to overlap perfectly), add a small ramp/startup penalty, inflate
+by a guardband, then divide by the device frequency to get time in ms.
+
+The lookup table (`operator_perf_map`) and the predictors
+(`tt_matmul_predictor` / `step3_predict_time`) only run AFTERWARDS inside
+`_try_operator_perf_lookup()` and OVERRIDE the analytical msecs when a
+measured/predicted value is available. The formulas below are the fallback
+and the canonical "core" model.
+
+
+--------------------------------------------------------------------------------
+1) COMPUTE CYCLES   --  execute_op() lines 239-244
+--------------------------------------------------------------------------------
+
+    op.compute_cycles = 0
+    for instr, instr_count in op.perf_stats['instrs'].items():
+        peak_ipc = simconfig_obj.peak_ipc(op.uses_compute_pipe, instr, op.precision)
+        real_ipc = peak_ipc * DG_COMPUTE_UTIL_CONSTANT
+        op.compute_cycles += ceil(instr_count / real_ipc)
+
+Formula:
+
+    compute_cycles = Σ_instr  ceil( instr_count / (peak_ipc * util_derate) )
+
+Where:
+    instr_count               = analytical op count from op.perf_stats['instrs']
+                                (e.g. for matmul: 2 * M * N * K MACs)
+    peak_ipc                  = arch-yaml peak instructions/cycle for
+                                (pipe, instr, precision)
+    DG_COMPUTE_UTIL_CONSTANT  = device-level compute utilization derate (<1)
+    pipe                      = 'matrix' or 'vector'
+
+
+--------------------------------------------------------------------------------
+2) MEMORY CYCLES   --  execute_op() lines 246-270
+--------------------------------------------------------------------------------
+
+    devfreq_MHz      = simconfig_obj.frequency(op.uses_compute_pipe, units='MHz')
+    mem_to_dev_ratio = devfreq_MHz / memfreq_MHz
+
+    mem_rd_bytes = op.perf_stats['inBytes']
+    mem_wr_bytes = op.perf_stats['outBytes']
+
+    # in MEMORY clock domain
+    mem_rd_cycles_memclk = mem_rd_bytes / eff_bw_bytes_per_cycle
+    mem_wr_cycles_memclk = mem_wr_bytes / eff_bw_bytes_per_cycle
+
+    # rebase to DEVICE clock domain
+    op.mem_rd_cycles = ceil(mem_rd_cycles_memclk * mem_to_dev_ratio)
+    op.mem_wr_cycles = ceil(mem_wr_cycles_memclk * mem_to_dev_ratio)
+
+Formula (device clock domain):
+
+    mem_cycles_dev = ((inBytes + outBytes) / eff_bw_bytes_per_cycle)
+                     * (f_dev / f_mem)
+
+Where:
+    inBytes / outBytes        = tensor_shape * dtype_size   (analytical)
+    eff_bw_bytes_per_cycle    = peak_DRAM_BW * mem_BW_util_derate
+                                (expressed per memory clock)
+    f_dev, f_mem              = device and memory frequencies (MHz)
+
+
+--------------------------------------------------------------------------------
+3) ROOF-LINE COMBINE + KERNEL TIME   --  get_exec_stats() lines 368-374
+--------------------------------------------------------------------------------
+
+    mem_cycles    = mem_rd_cycles + mem_wr_cycles
+    ramp_penalty  = simconfig_obj.ramp_penalty()
+    dev_freq_MHz  = simconfig_obj.frequency(op.uses_compute_pipe, units='MHz')
+
+    ideal_cycles  = ceil( max(compute_cycles, mem_cycles) + ramp_penalty )
+    ideal_msecs   = ideal_cycles / dev_freq_MHz / 1e3
+
+    cycles        = ceil( (1 + G_GUARDBAND) * ideal_cycles )
+    msecs         = cycles / dev_freq_MHz / 1e3        <-- KERNEL DEVICE TIME
+
+Master formula:
+
+    kernel_time_ms = ceil( (1 + guardband)
+                           * ( max(compute_cycles, mem_cycles) + ramp_penalty ) )
+                     / ( f_dev_MHz * 1e3 )
+
+
+--------------------------------------------------------------------------------
+4) WHERE EACH INPUT COMES FROM (NO LUT INVOLVED)
+--------------------------------------------------------------------------------
+
+    Symbol                       Source
+    ---------------------------- ----------------------------------------------
+    instr_count                  op.perf_stats['instrs']  (analytical, frontend)
+    inBytes / outBytes           op.perf_stats['inBytes'] / ['outBytes']
+                                 (tensor shape * dtype size)
+    peak_ipc                     arch yaml via
+                                 simconfig_obj.peak_ipc(pipe, instr, precision)
+    DG_COMPUTE_UTIL_CONSTANT     device config (compute derate)
+    eff_bw_bytes_per_cycle       peak_BW * mem_BW_util  (at memory clock)
+    devfreq_MHz, memfreq_MHz     arch frequencies
+    ramp_penalty                 simconfig_obj.ramp_penalty()
+    G_GUARDBAND                  device-level guardband constant
+
+
+--------------------------------------------------------------------------------
+5) FUSED OPS   --  device.py lines 198-231 / 355-366
+--------------------------------------------------------------------------------
+
+If an op is the head of a fusion group (op.fused_op_cycles is not None),
+get_exec_stats() takes:
+
+    compute_cycles = op.fused_op_cycles['compute_cycles']
+    mem_rd_cycles  = op.fused_op_cycles['mem_rd_cycles']
+    mem_wr_cycles  = op.fused_op_cycles['mem_wr_cycles']
+    matrix_cycles  = op.fused_op_cycles['matrix_cycles']
+    vector_cycles  = op.fused_op_cycles['vector_cycles']
+
+instead of the single-op values. The roof-line formula above is otherwise
+identical. Fused compute cycles are the sum of the constituent ops' compute
+cycles, each inflated by (1 + G_FUSE_OP_OVERLAP_COST_CONSTANT). Fused
+mem_rd_cycles = first op's mem_rd_cycles; fused mem_wr_cycles = last op's
+mem_wr_cycles.
+
+
+--------------------------------------------------------------------------------
+6) WHERE LUT / step3_predict_time WOULD OVERRIDE THIS
+   (shown for context -- NOT part of the core model)
+--------------------------------------------------------------------------------
+
+In get_exec_stats() right after `msecs` is computed analytically:
+
+    msecs, uses_perf_lookup, master_stats = self._try_operator_perf_lookup(
+        op, opname, wlgraph, msecs
+    )
+
+_try_operator_perf_lookup() (device.py lines 279-347):
+    1. Tries tt_matmul_predictor.predict_matmul_msecs(...)   (the step3 path)
+    2. Else tries self.operator_perf_map.lookup(...)         (the LUT path)
+    3. If either returns a value, msecs is REPLACED and cycles/ideal_cycles/
+       ideal_msecs are back-computed from it.
+
+Disable / bypass these to use ONLY the core analytical model.
+
+
+--------------------------------------------------------------------------------
+7) TL;DR
+--------------------------------------------------------------------------------
+
+    kernel_time = ( (1 + guardband)
+                    * ( max(compute_cycles, mem_cycles) + ramp_penalty ) )
+                  / device_freq
+
+    compute_cycles = Σ  instr_count / (peak_ipc * compute_util_derate)
+    mem_cycles     = (inBytes + outBytes) / eff_bw_per_cycle  *  f_dev / f_mem
+
+That is the core, lookup-free, predictor-free kernel device-time model in
+Polaris.
+================================================================================
