@@ -4,6 +4,8 @@
 
 from enum import Enum
 import os, sys
+import math as mth
+import numpy as np
 
 from loguru import logger
 from numpy import reshape
@@ -404,5 +406,152 @@ def scaled_dot_product_attention_decode(
     output = gqa_matmul(attn_probs, values, transposed=False)  # [1, seq_len_q, num_query_heads, head_dim]
     return output
 
-def paged_update_cache(keys, k_heads_1BKD, update_idxs_tensor, page_table):
-    pass
+# ----------------------------------------------------------------------
+# KV-cache helpers for Polaris simulator
+# ----------------------------------------------------------------------
+
+def _tensor_data(x):
+    return getattr(x, "data", None) if x is not None else None
+
+def _update_indices_to_list(update_idxs_tensor):
+    idx_data = _tensor_data(update_idxs_tensor)
+    if idx_data is None:
+        return None
+    return np.array(idx_data).astype(np.int32).reshape(-1).tolist()
+
+def fill_cache(cache_tensor, input_tensor, batch_idx):
+    """
+    Non-paged prefill cache write.
+    cache_tensor: [B, H, S, D]
+    input_tensor: [1, H, s, D] or [B, H, s, D]
+    Writes the prompt K/V into cache for one user.
+    """
+    cache_data = _tensor_data(cache_tensor)
+    input_data = _tensor_data(input_tensor)
+
+    if cache_data is None or input_data is None:
+        logger.warning("fill_cache: tensor data missing, returning cache tensor unchanged")
+        return cache_tensor
+
+    b = int(batch_idx)
+
+    if input_data.ndim != 4:
+        raise ValueError(f"fill_cache expected 4D input_tensor, got shape {input_data.shape}")
+
+    src = input_data[0] if input_data.shape[0] == 1 else input_data[b]
+
+    heads = min(src.shape[0], cache_data.shape[1])
+    seq = min(src.shape[1], cache_data.shape[2])
+    dim = min(src.shape[2], cache_data.shape[3])
+
+    cache_data[b, :heads, :seq, :dim] = src[:heads, :seq, :dim]
+    cache_tensor.data = cache_data
+    return cache_tensor
+
+def paged_fill_cache(cache_tensor, input_tensor, page_table, batch_idx=0):
+    """
+    Paged prefill cache write.
+    cache_tensor: [num_blocks, H, block_size, D]
+    input_tensor: [1, H, S, D] or [B, H, S, D]
+    page_table:   [B, max_blocks_per_seq]
+    """
+    cache_data = _tensor_data(cache_tensor)
+    input_data = _tensor_data(input_tensor)
+    page_data = _tensor_data(page_table)
+
+    if cache_data is None or input_data is None or page_data is None:
+        logger.warning("paged_fill_cache: tensor data missing, returning cache tensor unchanged")
+        return cache_tensor
+
+    b = int(batch_idx)
+
+    if input_data.ndim != 4:
+        raise ValueError(f"paged_fill_cache expected 4D input_tensor, got shape {input_data.shape}")
+
+    src = input_data[0] if input_data.shape[0] == 1 else input_data[b]
+
+    block_size = cache_data.shape[2]
+    heads = min(src.shape[0], cache_data.shape[1])
+    seq = src.shape[1]
+    dim = min(src.shape[2], cache_data.shape[3])
+
+    num_blocks_needed = int(np.ceil(seq / block_size))
+
+    for block in range(num_blocks_needed):
+        if block >= page_data.shape[1]:
+            break
+
+        physical_block = int(page_data[b, block])
+        if physical_block < 0 or physical_block >= cache_data.shape[0]:
+            continue
+
+        start = block * block_size
+        end = min(start + block_size, seq)
+        valid = end - start
+
+        cache_data[physical_block, :heads, :valid, :dim] = src[:heads, start:end, :dim]
+
+    cache_tensor.data = cache_data
+    return cache_tensor
+
+def paged_update_cache(cache_tensor, input_tensor, update_idxs_tensor, page_table):
+    """
+    Decode-time KV update.
+    Non-paged:
+        cache_tensor: [B, H, S, D]
+        input_tensor: [1, B, H, D]
+        update_idxs_tensor: [B]
+    Paged:
+        cache_tensor: [num_blocks, H, block_size, D]
+        input_tensor: [1, B, H, D]
+        page_table: [B, max_blocks_per_seq]
+    """
+    cache_data = _tensor_data(cache_tensor)
+    input_data = _tensor_data(input_tensor)
+    idxs = _update_indices_to_list(update_idxs_tensor)
+    page_data = _tensor_data(page_table)
+
+    if cache_data is None or input_data is None or idxs is None:
+        logger.warning("paged_update_cache: tensor data missing, returning cache tensor unchanged")
+        return cache_tensor
+
+    if input_data.ndim != 4:
+        raise ValueError(f"paged_update_cache expected 4D input_tensor, got shape {input_data.shape}")
+
+    batch = min(len(idxs), input_data.shape[1])
+    heads = min(input_data.shape[2], cache_data.shape[1])
+    dim = min(input_data.shape[3], cache_data.shape[3])
+
+    # Non-paged path
+    if page_data is None:
+        for b in range(batch):
+            pos = int(idxs[b])
+            if pos < 0 or pos >= cache_data.shape[2]:
+                continue
+            cache_data[b, :heads, pos, :dim] = input_data[0, b, :heads, :dim]
+
+        cache_tensor.data = cache_data
+        return cache_tensor
+
+    # Paged path
+    block_size = cache_data.shape[2]
+
+    for b in range(batch):
+        pos = int(idxs[b])
+        if pos < 0:
+            continue
+
+        block = pos // block_size
+        offset = pos % block_size
+
+        if block >= page_data.shape[1]:
+            continue
+
+        physical_block = int(page_data[b, block])
+        if physical_block < 0 or physical_block >= cache_data.shape[0]:
+            continue
+
+        cache_data[physical_block, :heads, offset, :dim] = input_data[0, b, :heads, :dim]
+
+    cache_tensor.data = cache_data
+    return cache_tensor
