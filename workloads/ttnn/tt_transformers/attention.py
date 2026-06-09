@@ -5,16 +5,46 @@
 import math
 from enum import Enum
 import os, sys
+import numpy as np
 from ttsim.front.ttnn.tensor import DataType
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
 import ttsim.front.ttnn as ttnn
 import workloads.ttnn.tt_transformers.utils as utils
 
+
+def _cur_pos_plus_one(current_pos):
+    """Effective K/V sequence length for decode SDPA (cur_pos + 1)."""
+    data = utils._tensor_data(current_pos)
+    if data is None:
+        return None
+    return int(np.array(data).reshape(-1)[0]) + 1
+
+
+def _sdpa_kv_tensors(keys, values, eff_len, dtype):
+    """Build K/V views with shortened seq dim so Polaris SDPA scales with context."""
+    return (
+        ttnn.Tensor(
+            shape=[keys.shape[0], keys.shape[1], eff_len, keys.shape[3]],
+            device=keys.device,
+            dtype=dtype,
+            layout=keys.layout,
+        ),
+        ttnn.Tensor(
+            shape=[values.shape[0], values.shape[1], eff_len, values.shape[3]],
+            device=values.device,
+            dtype=dtype,
+            layout=values.layout,
+        ),
+    )
+
+
 def tt_all_reduce(tensor, *args, **kwargs):
     return tensor
 
+
 def tt_all_gather(input_tensor, *args, **kwargs):
     return input_tensor
+
 
 class OpGroup(Enum):
     """
@@ -30,6 +60,7 @@ class OpGroup(Enum):
     LI_O_PREFILL = "li_o_prefill"
     SDPA_PREFILL = "sdpa_prefill"
 
+
 class TensorGroup(Enum):
     FF1_FF3 = "ff1_3"
     FF2 = "ff2"
@@ -37,6 +68,7 @@ class TensorGroup(Enum):
     WO = "wo"
     KV_CACHE = "kv_cache"
     ACTIVATION = "activation"
+
 
 class Attention():
     def __init__(
@@ -90,13 +122,12 @@ class Attention():
 
         self.compute_kernel_config_hifi2 = configuration.compute_kernel_config_hifi2
         self.compute_kernel_config_hifi2_fp16 = configuration.compute_kernel_config_hifi2_fp16
-
         self.compute_kernel_config_hifi4 = configuration.compute_kernel_config_hifi4
 
         self.transformation_mats = transformation_mats
         self.use_fused_qkv_op = getattr(configuration, 'use_fused_qkv_op', True)
 
-        self.model_config = None#configuration.get_model_config()
+        self.model_config = None  # configuration.get_model_config()
         self.ccl_topology = configuration.ccl_topology()
         self.is_multichip = configuration.is_multichip
         self.activation_dtype = ttnn.bfloat16
@@ -134,7 +165,7 @@ class Attention():
         assert configuration.qkv_size % self.num_devices_per_group == 0
         assert configuration.dim % self.num_devices_per_group == 0
 
-        wqkv_mem_config = None #dummy
+        wqkv_mem_config = None  # dummy
 
         qkv_list = []
         for i in range(self.num_devices_per_group):
@@ -146,7 +177,8 @@ class Attention():
             qkv_list.append(qkv)
 
         if self.moe:
-            qkv_cat = qkv_list[0].unsqueeze(0).unsqueeze(0) # For MOE, do not concat weights across experts, as each expert will select its own weights
+            # For MOE, do not concat weights across experts, as each expert will select its own weights
+            qkv_cat = qkv_list[0].unsqueeze(0).unsqueeze(0)
         else:
             qkv_cat = ttnn.cat(qkv_list, dim=-1).unsqueeze(0).unsqueeze(0)
 
@@ -165,8 +197,8 @@ class Attention():
         self.q_norm = lambda x, mode: x
         self.k_norm = lambda x, mode: x
 
-        self.use_fused_all_gather_matmul = False #self.model_config["USE_FUSED_ALL_GATHER_MATMUL"]
-        wo_str_weight = ttnn._rand((self.hidden_size, self.hidden_size//self.num_experts), device=self.mesh_device, dtype=ttnn.bfloat16)
+        self.use_fused_all_gather_matmul = False  # self.model_config["USE_FUSED_ALL_GATHER_MATMUL"]
+        wo_str_weight = ttnn._rand((self.hidden_size, self.hidden_size // self.num_experts), device=self.mesh_device, dtype=ttnn.bfloat16)
         pt_wo = wo_str_weight.unsqueeze(0).unsqueeze(0)
         wo_mem_config = None
 
@@ -185,54 +217,59 @@ class Attention():
                 cache_name("wo_width_sharded_2d") if (self.use_fused_all_gather_matmul or self.TG) else cache_name("wo")
             ),
         )
+
         if not use_paged_kv_cache:
             # vLLM provides its own kv cache
             self.init_kv_cache(configuration, weight_cache_path, device=mesh_device)
 
         if configuration.query_pre_attn_scalar is not None:
-            self.scale = configuration.query_pre_attn_scalar**-0.5
+            self.scale = configuration.query_pre_attn_scalar ** -0.5
         else:
-            self.scale = self.head_dim**-0.5
+            self.scale = self.head_dim ** -0.5
 
     def init_kv_cache(self, configuration, weight_cache_path, device=None):
         """
         Generates empty KV cache and pushed to device memory
         """
         if self.paged_attention_config:
-            ## False, not taken path
+            # False, not taken path
             cache_k = ttnn.zeros(
-                    [self.paged_attention_config.max_num_blocks,
-                    self.n_local_kv_heads,
-                    self.paged_attention_config.block_size,
-                    self.head_dim],
-                    dtype=ttnn.bfloat16,
-                    device=device, layout=ttnn.TILE_LAYOUT
+                [self.paged_attention_config.max_num_blocks,
+                 self.n_local_kv_heads,
+                 self.paged_attention_config.block_size,
+                 self.head_dim],
+                dtype=ttnn.bfloat16,
+                device=device, layout=ttnn.TILE_LAYOUT
             )
             cache_v = ttnn.zeros(
-                    [self.paged_attention_config.max_num_blocks,
-                    self.n_local_kv_heads,
-                    self.paged_attention_config.block_size,
-                    self.head_dim],
-                    dtype=ttnn.bfloat16,
-                    device=device, layout=ttnn.TILE_LAYOUT
+                [self.paged_attention_config.max_num_blocks,
+                 self.n_local_kv_heads,
+                 self.paged_attention_config.block_size,
+                 self.head_dim],
+                dtype=ttnn.bfloat16,
+                device=device, layout=ttnn.TILE_LAYOUT
             )
         else:
             cache_k = ttnn.zeros(
-                    [self.batch_size_per_device_group,
-                    self.n_local_kv_heads,
-                    self.max_seq_len,
-                    self.head_dim,], device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+                [self.batch_size_per_device_group,
+                 self.n_local_kv_heads,
+                 self.max_seq_len,
+                 self.head_dim],
+                device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            )
             cache_v = ttnn.zeros(
                 [self.batch_size_per_device_group,
-                    self.n_local_kv_heads,
-                    self.max_seq_len,
-                    self.head_dim,], device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+                 self.n_local_kv_heads,
+                 self.max_seq_len,
+                 self.head_dim],
+                device=device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+            )
 
         self.layer_past = [
             ttnn.as_tensor(
                 k_or_v,
                 dtype=self.kv_cache_dtype,
-                layout=ttnn.TILE_LAYOUT, #self.model_config["ATTN_W_LAYOUT_TILE"],
+                layout=ttnn.TILE_LAYOUT,
                 device=self.mesh_device,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
                 mesh_mapper=ttnn.ReplicateTensorToMesh(self.mesh_device),
@@ -252,6 +289,7 @@ class Attention():
         rot_mats=None,
         page_table=None,
         kv_cache=None,
+        kv_slice=True,
     ) -> ttnn.Tensor:
         """
         x: (seq_len, 1, batch, dim)
@@ -261,14 +299,10 @@ class Attention():
         # QKV matmuls
         # Use HiFi2 for DRAM-sharded matmuls as they are otherwise flop-bound. Loses 1 bit of activation precision.
         ###
-        xqkv_fused_sharded = ttnn.linear(
-            x,
-            self.wqkv,
-        )
+        xqkv_fused_sharded = ttnn.linear(x, self.wqkv)
+
         # FIXME: File bug against dram-sharded matmuls with bias
         if self.wqkv_bias_decode:
-            # select the bias tensor based on the number of tiles in the rows
-            # WARNING: must not change the batch size between compiling and executing a trace
             num_tiles = int(math.ceil(xqkv_fused_sharded.shape[-2] / self.tile_size))
             xqkv_fused_sharded = xqkv_fused_sharded + self.wqkv_bias_decode[num_tiles - 1]
 
@@ -279,12 +313,13 @@ class Attention():
             cluster_axis=1,
             num_reduce_scatter_links=self.num_reduce_scatter_links,
             num_all_gather_links=self.num_all_gather_links,
-            memory_config=None, #self.model_config["QKV_OUT_GATHERED_MEMCFG"](list(self.mesh_device.shape)[1]),
+            memory_config=None,
             sharded=True,
             dtype=self.ccl_dtype,
             topology=self.ccl_topology,
         )
         ttnn.deallocate(xqkv_fused_sharded)
+
         # Reshape such that true unpadded batch is tracked in shape
         fqkv_shape = xqkv_fused.shape
         xqkv_fused = ttnn.reshape(
@@ -299,7 +334,7 @@ class Attention():
             xqkv_fused,
             num_heads=self.n_local_heads,
             num_kv_heads=self.n_local_kv_heads,
-            memory_config=None, #self.model_config["CREATE_QKV_DECODE_SHARD"],
+            memory_config=None,
         )
 
         q_heads_pre_rot_1BQD = self.q_norm(q_heads_pre_rot_1BQD, mode="decode")
@@ -320,7 +355,7 @@ class Attention():
         ttnn.deallocate(k_heads_pre_rot_1BKD)
 
         ###
-        # KV update
+        # KV update — write new K, V into cache at current_pos
         ###
         if kv_cache:
             keys = kv_cache[0]
@@ -329,45 +364,49 @@ class Attention():
             keys = self.layer_past[0]
             values = self.layer_past[1]
 
+        # Cache update needs FULL tensor to write at current_pos
         utils.paged_update_cache(keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table)
         utils.paged_update_cache(values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table)
 
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
 
-        # NOTE: Varying the batch size will result in slightly different outputs.
-        # For example, a prompt w/ 1 user vs, the same prompt repeated N times for N users, will produce different outputs
-        # This is because the SDPA op in decode mode has different number of reductions depending on batch size
-        # Which leads to slightly different outputs from attention (due to accumulated errors)
+        # Shrink K/V seq dim to cur_pos+1 before SDPA so Polaris models context length,
+        # not full max_seq_len cache size.
+        keys_sdpa, values_sdpa = keys, values
+        if kv_slice and not page_table:
+            eff_len = _cur_pos_plus_one(current_pos)
+            if eff_len is not None and eff_len < keys.shape[2]:
+                keys_sdpa, values_sdpa = _sdpa_kv_tensors(
+                    keys, values, eff_len, self.kv_cache_dtype
+                )
+
         if page_table:
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
                 q_heads_1BQD,
-                keys,
-                values,
+                keys_sdpa,
+                values_sdpa,
                 cur_pos_tensor=current_pos,
                 page_table_tensor=page_table,
                 scale=self.scale,
-                program_config=None, #self.model_config["SDPA_DECODE_PROGCFG"],
+                program_config=None,
                 compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         else:
             attn_output_1G4D = utils.scaled_dot_product_attention_decode(
                 q_heads_1BQD,
-                keys,
-                values,
+                keys_sdpa,      # ✅ [B, heads, cur_pos+1, head_dim] — not max_seq_len!
+                values_sdpa,    # ✅ [B, heads, cur_pos+1, head_dim]
                 cur_pos_tensor=current_pos,
                 scale=self.scale,
-                program_config=None, #self.model_config["SDPA_DECODE_PROGCFG"],
+                program_config=None,
                 compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,  # FIXME: why not L1 height sharded e.g. SCORES_BATCHED_MM_OUTPUT_MEMCFG?
+                memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
         ttnn.deallocate(q_heads_1BQD)
 
-        attn_output_11BH = ttnn.to_memory_config(
-            attn_output_1G4D,
-            memory_config=None #self.model_config["SCORES_BATCHED_MM_OUTPUT_MEMCFG"](self.batch_size_per_device_group),
-        )
+        attn_output_11BH = ttnn.to_memory_config(attn_output_1G4D, memory_config=None)
 
         attn_output_cat = utils.nlp_concat_heads_decode(
             attn_output_11BH,
@@ -377,22 +416,20 @@ class Attention():
         ttnn.deallocate(attn_output_1G4D)
 
         if self.use_fused_all_gather_matmul:
-            attn_output_cat = ttnn.to_memory_config(
-                attn_output_cat, None, #self.model_config["ATTN_ALL_GATHER_MATMUL_OUTPUT_MEMCFG"]
-            )
+            attn_output_cat = ttnn.to_memory_config(attn_output_cat, None)
             _, dense_out_sharded, _ = ttnn.experimental.all_gather_matmul(
                 attn_output_cat,
                 self.wo,
                 dim=3,
                 all_gather_core_grid_offset=(0, 4),
                 num_links=1,
-                program_config=None, #self.model_config["ATTN_ALL_GATHER_MATMUL_PROGCFG"],
+                program_config=None,
                 compute_kernel_config=self.li_o_decode_compute_kernel_cfg,
-                memory_config_ag=None, #self.model_config["ATTN_ALL_GATHER_MATMUL_OUTPUT_MEMCFG"],
-                memory_config_mm=None, #self.model_config["DECODE_RESIDUAL_MEMCFG"],
+                memory_config_ag=None,
+                memory_config_mm=None,
             )
             ttnn.deallocate(attn_output_cat)
-            dense_out_sharded = ttnn.to_memory_config(dense_out_sharded) #, self.model_config["DECODE_RESIDUAL_MEMCFG"])
+            dense_out_sharded = ttnn.to_memory_config(dense_out_sharded)
             return dense_out_sharded
 
         else:
@@ -402,17 +439,13 @@ class Attention():
                 dim=2,
                 cluster_axis=1,
                 num_links=2,
-                memory_config=None, #self.model_config["GATHER_USERS_MEMCFG"](list(self.mesh_device.shape)[1]),
+                memory_config=None,
                 sharded=True,
-                # dtype=self.ccl_dtype,  # Running bf16 until we have SDPA output bfp8 df; otherwise we have two sharded to interleaved/interleaved to sharded conversions
             )
 
             attn_output = ttnn.cat([attn_output] * self.num_experts, dim=-1)
             gather_wo = ttnn.repeat(self.wo, [1, 1, 1, self.num_experts])
-            dense_out_sharded = ttnn.matmul(
-                attn_output,
-                gather_wo
-            )
+            dense_out_sharded = ttnn.matmul(attn_output, gather_wo)
 
             ttnn.deallocate(attn_output_cat)
 
@@ -429,15 +462,16 @@ class Attention():
                 dtype=self.ccl_dtype,
                 use_composite=True if self.hidden_size == 8192 else False,
             )
+
             if self.num_experts > 1:
                 o_shape = dense_out_reduced.shape
-                dense_out_reduced = ttnn._rand(shape=[o_shape[0], o_shape[2], o_shape[1], o_shape[3]//self.num_experts],
-                                            device=self.mesh_device, dtype=ttnn.bfloat16) # mimics reduction of experts' outputs
+                dense_out_reduced = ttnn._rand(
+                    shape=[o_shape[0], o_shape[2], o_shape[1], o_shape[3] // self.num_experts],
+                    device=self.mesh_device, dtype=ttnn.bfloat16,
+                )  # mimics reduction of experts' outputs
 
             if not self.TG:
-                dense_out_reduced = ttnn.to_memory_config(
-                    dense_out_reduced, None #self.model_config["DECODE_RESIDUAL_MEMCFG"]
-                )
+                dense_out_reduced = ttnn.to_memory_config(dense_out_reduced, None)
 
             return dense_out_reduced
 
@@ -453,11 +487,10 @@ class Attention():
     ):
         seq_len = x_11SH.shape[-2]
         assert seq_len % 128 == 0 and seq_len > 0, "Seqlen must be divisible by 128"
+
         ###
         # QKV matmuls
         ###
-
-        # reshaping long sequence to matmul fit on device
         if seq_len > self.MAX_QKV_MM_SEQ_LEN:
             if seq_len % self.MAX_QKV_MM_SEQ_LEN != 0:
                 raise ValueError(f"seq_len {seq_len} must be divisible by {self.MAX_QKV_MM_SEQ_LEN}")
@@ -466,10 +499,9 @@ class Attention():
         xqkv_fused = ttnn.linear(
             x_11SH,
             self.wqkv,
-            # dtype=self.ccl_dtype if self.TG else self.activation_dtype or ttnn.bfloat16,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
             compute_kernel_config=self.li_qkv_prefill_compute_kernel_cfg,
-            program_config=None, #self.model_config["XQKV_PREFILL_PROGCFG"](seq_len),
+            program_config=None,
         )
         if self.wqkv_bias_prefill is not None:
             xqkv_fused = xqkv_fused + self.wqkv_bias_prefill
@@ -511,7 +543,7 @@ class Attention():
         ###
         # Rotary embeddings
         ###
-        if DataType.from_numpy(q_heads_1QSD_pre_rot.dtype) != ttnn.bfloat16:  # Rotary embeddings require bfloat16 inputs
+        if DataType.from_numpy(q_heads_1QSD_pre_rot.dtype) != ttnn.bfloat16:
             q_heads_1QSD_pre_rot = ttnn.typecast(q_heads_1QSD_pre_rot, dtype=ttnn.bfloat16)
 
         q_heads_1QSD = utils.rotary_embedding_llama(
@@ -523,7 +555,7 @@ class Attention():
         )
         ttnn.deallocate(q_heads_1QSD_pre_rot)
 
-        if DataType.from_numpy(k_heads_1KSD_pre_rot.dtype) != ttnn.bfloat16:  # Rotary embeddings require bfloat16 inputs
+        if DataType.from_numpy(k_heads_1KSD_pre_rot.dtype) != ttnn.bfloat16:
             k_heads_1KSD_pre_rot = ttnn.typecast(k_heads_1KSD_pre_rot, dtype=ttnn.bfloat16)
 
         k_heads_1KSD = utils.rotary_embedding_llama(
@@ -535,11 +567,50 @@ class Attention():
         )
         ttnn.deallocate(k_heads_1KSD_pre_rot)
 
-        k_heads_1KSD_8b = ttnn.typecast(k_heads_1KSD, dtype=ttnn.bfloat8_b)#keys_BKSD.dtype)
-        v_heads_1VSD_8b = ttnn.typecast(v_heads_1VSD, dtype=ttnn.bfloat8_b)#values_BKSD.dtype)
+        # KV cache fill
+        if kv_cache is not None:
+            keys_BKSD = kv_cache[0]
+            values_BKSD = kv_cache[1]
+        else:
+            keys_BKSD = self.layer_past[0]
+            values_BKSD = self.layer_past[1]
 
-        # SDPA
-        q_heads_1QSD_8b = ttnn.typecast(q_heads_1QSD, dtype=self.activation_dtype) # or ttnn.bfloat8_b)
+        k_fill = ttnn.typecast(k_heads_1KSD, dtype=self.kv_cache_dtype)
+        v_fill = ttnn.typecast(v_heads_1VSD, dtype=self.kv_cache_dtype)
+
+        fill_page_table = chunk_page_table if chunk_page_table is not None else page_table
+
+        # Resolve chunk offset (None means start at 0)
+        cs_idx = int(chunk_start_idx) if chunk_start_idx is not None else 0
+
+        if fill_page_table is not None:
+            block_size = keys_BKSD.shape[2]
+            page_len = fill_page_table.shape[1] * block_size
+
+            k_fill_sliced = k_fill[:, :, :page_len, :] if page_len < k_fill.shape[2] else k_fill
+            v_fill_sliced = v_fill[:, :, :page_len, :] if page_len < v_fill.shape[2] else v_fill
+
+            utils.paged_fill_cache(keys_BKSD, k_fill_sliced, fill_page_table, batch_idx=user_id, start_idx=cs_idx)
+            utils.paged_fill_cache(values_BKSD, v_fill_sliced, fill_page_table, batch_idx=user_id, start_idx=cs_idx)
+
+            if k_fill_sliced is not k_fill:
+                ttnn.deallocate(k_fill_sliced)
+            if v_fill_sliced is not v_fill:
+                ttnn.deallocate(v_fill_sliced)
+        else:
+            utils.fill_cache(keys_BKSD, k_fill, user_id % self.batch_size_per_device_group, start_idx=cs_idx)
+            utils.fill_cache(values_BKSD, v_fill, user_id % self.batch_size_per_device_group, start_idx=cs_idx)
+
+        k_heads_1KSD_8b = ttnn.typecast(k_heads_1KSD, dtype=ttnn.bfloat8_b)
+        v_heads_1VSD_8b = ttnn.typecast(v_heads_1VSD, dtype=ttnn.bfloat8_b)
+
+        ttnn.deallocate(k_fill)
+        ttnn.deallocate(v_fill)
+        ttnn.deallocate(k_heads_1KSD)
+        ttnn.deallocate(v_heads_1VSD)
+
+        # SDPA — uses locally computed K/V (not cache), correct for prefill
+        q_heads_1QSD_8b = ttnn.typecast(q_heads_1QSD, dtype=self.activation_dtype)
         ttnn.deallocate(q_heads_1QSD)
 
         attn_output_84SD = utils.scaled_dot_product_attention(
@@ -548,8 +619,8 @@ class Attention():
             v_heads_1VSD_8b,
             is_causal=True,
             scale=self.scale,
-            compute_kernel_config=None, #self.sdpa_prefill_compute_kernel_cfg,
-            program_config=None, #self.model_config["SDPA_PROGCFG"](seq_len),
+            compute_kernel_config=None,
+            program_config=None,
         )
 
         ttnn.deallocate(q_heads_1QSD_8b)
@@ -568,30 +639,26 @@ class Attention():
         )
         ttnn.deallocate(attn_output_1QSD)
 
-        # Non fused All Gather Matmul
         if self.use_fused_all_gather_matmul:  # is true for Ring topology
             attn_output_11SH = ttnn.all_gather(
-                attn_output_11SH,
-                dim=3,
-                num_links=1,
-                topology=self.ccl_topology,
-                memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                attn_output_11SH, dim=3, num_links=1,
+                topology=self.ccl_topology, memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
-        attn_output_11SH = ttnn.cat([attn_output_11SH] * self.num_experts, dim=-1) # gather attn_output for all experts
+            attn_output_11SH = ttnn.cat([attn_output_11SH] * self.num_experts, dim=-1)
 
         output_11SH = ttnn.linear(
             attn_output_11SH,
             self.wo,
             compute_kernel_config=self.li_o_prefill_compute_kernel_cfg,
-            dtype=self.activation_dtype, # or ttnn.bfloat8_b,
+            dtype=self.activation_dtype,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
-            program_config=None, #self.model_config["WO_PREFILL_PROGCFG"](seq_len),
+            program_config=None,
         )
 
         if seq_len > 1024:
             output_11SH = ttnn.reshape(output_11SH, [1, 1, seq_len, -1])
         ttnn.deallocate(attn_output_11SH)
-        # Reduce-scatter
+
         if not self.use_fused_all_gather_matmul:
             output_11SH = tt_all_reduce(
                 output_11SH,
@@ -607,13 +674,16 @@ class Attention():
 
         return output_11SH
 
-    def __call__(self, 
+    def __call__(
+        self,
         attention_input,
         current_pos=None,
         rot_mats=None,
         user_id=0,
         mode="prefill",
         page_table=None,
+        kv_cache=None,
+        kv_slice=True,
     ):
         return self.forward(
             attention_input,
@@ -622,6 +692,8 @@ class Attention():
             user_id=user_id,
             mode=mode,
             page_table=page_table,
+            kv_cache=kv_cache,
+            kv_slice=kv_slice,
         )
 
     def forward(
@@ -635,6 +707,7 @@ class Attention():
         chunk_page_table=None,
         chunk_start_idx=None,
         kv_cache=None,
+        kv_slice=True,
     ):
         if mode == "prefill":
             return self.forward_prefill(
@@ -647,4 +720,8 @@ class Attention():
                 kv_cache=kv_cache,
             )
         else:
-            return self.forward_decode(x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache)
+            return self.forward_decode(
+                x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache, kv_slice=kv_slice,
+            )
+
+

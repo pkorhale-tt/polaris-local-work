@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
  
 import os, sys
+import numpy as np
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
 import ttsim.front.ttnn as ttnn
 from workloads.ttnn.tt_transformers.model import Transformer
@@ -49,7 +50,7 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
         max_seq_len=max_seq_len,
         max_batch_size=batch_size,
     )
-    iterations = 1
+    iterations = cfg.get('iterations', 1)
 
     if layers is not None:
         model_args.n_layers = layers
@@ -57,8 +58,9 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
 
     prompts = ["This is a test"] * model_args.max_batch_size
     encoded_prompts = [128000]
-    generation_start_pos = 0
+    generation_start_pos = cfg.get('start_pos', 512)
     generation_length = iterations
+    kv_slice = cfg.get('kv_slice', True)
     page_table_tt = None
     paged_attention_config = None
 
@@ -73,6 +75,16 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
     )
     logger.info("Model and caches loaded.")
 
+    # ✅ FIX: Build kv_cache from each layer's pre-allocated layer_past
+    kv_cache = [
+        [
+            tt_model.layers[i].attention.layer_past[0],
+            tt_model.layers[i].attention.layer_past[1],
+        ]
+        for i in range(model_args.n_layers)
+    ]
+    logger.info(f"KV cache built for {model_args.n_layers} layers.")
+
     seqlen = 1  # Generating one token per user at a time
     batch = model_args.max_batch_size
 
@@ -80,28 +92,29 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
     encoded_prompts_tensor = ttnn._rand(shape=(len(encoded_prompts), batch), device=ttnn_device, dtype=ttnn.int32)
     tt_decode_input = tt_model.embd(encoded_prompts_tensor).view(seqlen, batch, -1)
 
-    # Initial positions
-    generation_pos = [generation_start_pos for _ in range(batch)]
-    current_pos = ttnn._rand(shape=(len(generation_pos),), device=ttnn_device, dtype=ttnn.int32)
-    current_pos = current_pos.unsqueeze(0)
-    current_pos_tensor = ttnn.from_torch(
-        current_pos,
-        device=ttnn_device,
-        dtype=ttnn.int32,
-        mesh_mapper=ttnn.ShardTensor2dMesh(
-            ttnn_device,
-            dims=(None, 0) if (model_args.is_galaxy and batch_size > 1) else (None, None),
-            mesh_shape=model_args.cluster_shape,
-        ),
-    )
-
     for i in range(generation_length):
-        logger.info(f"[Model] Generating token {i}")
+        pos = generation_start_pos + i
+        pos_np = np.array([pos] * batch_size, dtype=np.int32)
+        current_pos_tensor = ttnn.Tensor(
+            shape=(batch_size,),
+            device=ttnn_device,
+            dtype=ttnn.int32,
+            data=pos_np,
+        )
+        rot_idxs_np = pos_np.reshape(1, batch_size)
+        rot_idxs = ttnn.Tensor(
+            shape=(1, batch_size),
+            device=ttnn_device,
+            dtype=ttnn.int32,
+            data=rot_idxs_np,
+        )
+
+        logger.info(f"[Model] Generating token {i} at position {pos} (kv_slice={kv_slice})")
         decode_input = model_args.prepare_residual_tensor_decode(
             tt_decode_input,
             None, #model_args.model_config["DECODE_RESIDUAL_MEMCFG"],
         )
-        rot_mats = tt_model.rope_setup.get_rot_mats(current_pos)
+        rot_mats = tt_model.rope_setup.get_rot_mats(rot_idxs)
         # Run TT model
         tt_out = tt_model(
             decode_input,
@@ -109,6 +122,8 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
             rot_mats=rot_mats,
             mode="decode",
             page_table=page_table_tt,
+            kv_cache=kv_cache,
+            kv_slice=kv_slice,
         )
         tt_output_torch = ttnn.permute(ttnn.to_torch(tt_out), (1, 2, 0, 3)).squeeze(2)#[: model_args.max_batch_size, 0:1, : model_args.vocab_size]
         
