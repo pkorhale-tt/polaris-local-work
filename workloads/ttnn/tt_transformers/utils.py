@@ -373,6 +373,12 @@ def scaled_dot_product_attention_decode(
                 k_head = Tensor(shape=(batch_size, 1, kdim, seq_len_k), device=keys.device, dtype=k_dtype_arg)
             else:
                 k_head = Tensor(shape=(batch_size, 1, seq_len_k, kdim), device=keys.device, dtype=k_dtype_arg)
+            # Propagate memory config from the K/V cache tensor so MatMul inBytes
+            # correctly counts DRAM bytes when dram_model=True, or skips them
+            # when suppressed to L1 by dram_model=False.
+            kv_mc = getattr(kv_head, '_memory_config', None)
+            if kv_mc is not None:
+                k_head._memory_config = kv_mc
             attn_score = ttnn.matmul(q_head, k_head)
             bs, slq, _, ldim = attn_score.shape
         attn_scores = Tensor(shape=(bs, slq, num_query_heads, ldim), device=q_heads_1BQD.device, dtype=q_dtype_arg)
@@ -494,7 +500,7 @@ def paged_fill_cache(cache_tensor, input_tensor, page_table, batch_idx=0):
     cache_tensor.data = cache_data
     return cache_tensor
 
-def paged_update_cache(cache_tensor, input_tensor, update_idxs_tensor, page_table):
+def paged_update_cache(cache_tensor, input_tensor, update_idxs_tensor, page_table=None, dram_model=True):
     """
     Decode-time KV update.
     Non-paged:
@@ -531,6 +537,10 @@ def paged_update_cache(cache_tensor, input_tensor, update_idxs_tensor, page_tabl
             cache_data[b, :heads, pos, :dim] = input_data[0, b, :heads, :dim]
 
         cache_tensor.data = cache_data
+        # Model DRAM write cost: tag input as DRAM so downstream stats count
+        # one new-token write (shape [1, B, H, D]) as a DRAM store.
+        if dram_model:
+            input_tensor._memory_config = ttnn.DRAM_MEMORY_CONFIG
         return cache_tensor
 
     # Paged path
@@ -554,4 +564,6 @@ def paged_update_cache(cache_tensor, input_tensor, update_idxs_tensor, page_tabl
         cache_data[physical_block, :heads, offset, :dim] = input_data[0, b, :heads, :dim]
 
     cache_tensor.data = cache_data
+    if dram_model:
+        input_tensor._memory_config = ttnn.DRAM_MEMORY_CONFIG
     return cache_tensor

@@ -162,6 +162,7 @@ class TransformerBlock():
         chunk_start_idx=None,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
     ) -> ttnn.Tensor:
         TG = self.args.is_galaxy
         skip_mem_cfg = None
@@ -177,6 +178,7 @@ class TransformerBlock():
             chunk_start_idx=chunk_start_idx,
             kv_cache=kv_cache,
             kv_slice=kv_slice,
+            dram_model=dram_model,
         )
         h = ttnn.add(x, attn_out, memory_config=skip_mem_cfg)
         ttnn.deallocate(attn_out)

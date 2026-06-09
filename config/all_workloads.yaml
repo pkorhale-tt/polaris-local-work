@@ -175,8 +175,9 @@ workloads:
     basedir: workloads/ttnn/llama3
     module : run_llama3@test_llama3_decode.py
     instances:
-      llama3_8b_decode: { bs: 1, model_name: llama3-8B, start_pos: 512, iterations: 1, kv_slice: true }
-      llama3_8b_decode_baseline: { bs: 1, model_name: llama3-8B, start_pos: 512, iterations: 1, kv_slice: false }
+      llama3_8b_decode:              { bs: 1, model_name: llama3-8B, start_pos: 512, iterations: 1, kv_slice: true,  dram_model: true  }
+      llama3_8b_decode_baseline:     { bs: 1, model_name: llama3-8B, start_pos: 512, iterations: 1, kv_slice: false, dram_model: false }
+      llama3_8b_decode_baseline_dram: { bs: 1, model_name: llama3-8B, start_pos: 512, iterations: 1, kv_slice: false, dram_model: true  }
 
   - api: TTNN
     name: llama3_prefill
@@ -190,8 +191,9 @@ workloads:
     basedir: workloads/ttnn/mistral
     module : test_model_inference@test_model.py
     instances:
-      mistral_7b_decode: { bs: 1, model_name: Mistral-7B, layers: 1, max_seq_len: 4096, start_pos: 512, iterations: 1, kv_slice: true }
-      mistral_7b_decode_baseline: { bs: 1, model_name: Mistral-7B, layers: 1, max_seq_len: 4096, start_pos: 512, iterations: 1, kv_slice: false }
+      mistral_7b_decode:              { bs: 1, model_name: Mistral-7B, layers: 1, max_seq_len: 4096, start_pos: 512, iterations: 1, kv_slice: true,  dram_model: true  }
+      mistral_7b_decode_baseline:     { bs: 1, model_name: Mistral-7B, layers: 1, max_seq_len: 4096, start_pos: 512, iterations: 1, kv_slice: false, dram_model: false }
+      mistral_7b_decode_baseline_dram: { bs: 1, model_name: Mistral-7B, layers: 1, max_seq_len: 4096, start_pos: 512, iterations: 1, kv_slice: false, dram_model: true  }
 
   - api: TTNN
     name: mistral_prefill

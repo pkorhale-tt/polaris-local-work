@@ -61,6 +61,7 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
     generation_start_pos = cfg.get('start_pos', 512)
     generation_length = iterations
     kv_slice = cfg.get('kv_slice', True)
+    dram_model = cfg.get('dram_model', True)
     page_table_tt = None
     paged_attention_config = None
 
@@ -109,7 +110,7 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
             data=rot_idxs_np,
         )
 
-        logger.info(f"[Model] Generating token {i} at position {pos} (kv_slice={kv_slice})")
+        logger.info(f"[Model] Generating token {i} at position {pos} (kv_slice={kv_slice}, dram_model={dram_model})")
         decode_input = model_args.prepare_residual_tensor_decode(
             tt_decode_input,
             None, #model_args.model_config["DECODE_RESIDUAL_MEMCFG"],
@@ -124,6 +125,7 @@ def run_llama3(wlname: str, ttnn_device: TTNNDevice, cfg: dict):
             page_table=page_table_tt,
             kv_cache=kv_cache,
             kv_slice=kv_slice,
+            dram_model=dram_model,
         )
         tt_output_torch = ttnn.permute(ttnn.to_torch(tt_out), (1, 2, 0, 3)).squeeze(2)#[: model_args.max_batch_size, 0:1, : model_args.vocab_size]
         

@@ -20,22 +20,28 @@ def _cur_pos_plus_one(current_pos):
     return int(np.array(data).reshape(-1)[0]) + 1
 
 
-def _sdpa_kv_tensors(keys, values, eff_len, dtype):
-    """Build K/V views with shortened seq dim so Polaris SDPA scales with context."""
-    return (
-        ttnn.Tensor(
-            shape=[keys.shape[0], keys.shape[1], eff_len, keys.shape[3]],
-            device=keys.device,
-            dtype=dtype,
-            layout=keys.layout,
-        ),
-        ttnn.Tensor(
-            shape=[values.shape[0], values.shape[1], eff_len, values.shape[3]],
-            device=values.device,
-            dtype=dtype,
-            layout=values.layout,
-        ),
+def _sdpa_kv_tensors(keys, values, eff_len, dtype, dram_model=True):
+    """
+    Build K/V tensors with shortened seq dim so Polaris SDPA sees cur_pos+1.
+    Tag memory config so MatMul inBytes counts DRAM bytes when dram_model=True,
+    or suppresses them (L1) when dram_model=False.
+    """
+    mc = ttnn.DRAM_MEMORY_CONFIG if dram_model else ttnn.L1_MEMORY_CONFIG
+    keys_sdpa = ttnn.Tensor(
+        shape=[keys.shape[0], keys.shape[1], eff_len, keys.shape[3]],
+        device=keys.device,
+        dtype=dtype,
+        layout=keys.layout,
     )
+    values_sdpa = ttnn.Tensor(
+        shape=[values.shape[0], values.shape[1], eff_len, values.shape[3]],
+        device=values.device,
+        dtype=dtype,
+        layout=values.layout,
+    )
+    keys_sdpa._memory_config   = mc
+    values_sdpa._memory_config = mc
+    return keys_sdpa, values_sdpa
 
 
 def tt_all_reduce(tensor, *args, **kwargs):
@@ -290,6 +296,7 @@ class Attention():
         page_table=None,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
     ) -> ttnn.Tensor:
         """
         x: (seq_len, 1, batch, dim)
@@ -365,8 +372,18 @@ class Attention():
             values = self.layer_past[1]
 
         # Cache update needs FULL tensor to write at current_pos
-        utils.paged_update_cache(keys, k_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table)
-        utils.paged_update_cache(values, v_heads_1BKD, update_idxs_tensor=current_pos, page_table=page_table)
+        utils.paged_update_cache(
+            keys, k_heads_1BKD,
+            update_idxs_tensor=current_pos,
+            page_table=page_table,
+            dram_model=dram_model,
+        )
+        utils.paged_update_cache(
+            values, v_heads_1BKD,
+            update_idxs_tensor=current_pos,
+            page_table=page_table,
+            dram_model=dram_model,
+        )
 
         ttnn.deallocate(k_heads_1BKD)
         ttnn.deallocate(v_heads_1BKD)
@@ -374,12 +391,24 @@ class Attention():
         # Shrink K/V seq dim to cur_pos+1 before SDPA so Polaris models context length,
         # not full max_seq_len cache size.
         keys_sdpa, values_sdpa = keys, values
+        sliced = False
         if kv_slice and not page_table:
             eff_len = _cur_pos_plus_one(current_pos)
             if eff_len is not None and eff_len < keys.shape[2]:
                 keys_sdpa, values_sdpa = _sdpa_kv_tensors(
-                    keys, values, eff_len, self.kv_cache_dtype
+                    keys, values, eff_len, self.kv_cache_dtype, dram_model=dram_model,
                 )
+                sliced = True
+
+        # For the baseline path (no slice), tag the shared cache tensors with the
+        # correct memory config so MatMul inBytes is counted accurately.
+        # We restore afterwards to avoid mutating persistent layer_past state.
+        if not sliced and not page_table:
+            mc = ttnn.DRAM_MEMORY_CONFIG if dram_model else ttnn.L1_MEMORY_CONFIG
+            _orig_k_mc = getattr(keys_sdpa, '_memory_config', None)
+            _orig_v_mc = getattr(values_sdpa, '_memory_config', None)
+            keys_sdpa._memory_config   = mc
+            values_sdpa._memory_config = mc
 
         if page_table:
             attn_output_1G4D = ttnn.transformer.paged_scaled_dot_product_attention_decode(
@@ -396,14 +425,20 @@ class Attention():
         else:
             attn_output_1G4D = utils.scaled_dot_product_attention_decode(
                 q_heads_1BQD,
-                keys_sdpa,      # ✅ [B, heads, cur_pos+1, head_dim] — not max_seq_len!
-                values_sdpa,    # ✅ [B, heads, cur_pos+1, head_dim]
+                keys_sdpa,
+                values_sdpa,
                 cur_pos_tensor=current_pos,
                 scale=self.scale,
                 program_config=None,
                 compute_kernel_config=self.sdpa_decode_compute_kernel_cfg,
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
+            # Restore original memory_config on shared cache tensors to avoid
+            # persisting the temporary tag across iterations.
+            if not sliced:
+                keys_sdpa._memory_config   = _orig_k_mc
+                values_sdpa._memory_config = _orig_v_mc
+
         ttnn.deallocate(q_heads_1BQD)
 
         attn_output_11BH = ttnn.to_memory_config(attn_output_1G4D, memory_config=None)
@@ -684,6 +719,7 @@ class Attention():
         page_table=None,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
     ):
         return self.forward(
             attention_input,
@@ -694,6 +730,7 @@ class Attention():
             page_table=page_table,
             kv_cache=kv_cache,
             kv_slice=kv_slice,
+            dram_model=dram_model,
         )
 
     def forward(
@@ -708,6 +745,7 @@ class Attention():
         chunk_start_idx=None,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
     ):
         if mode == "prefill":
             return self.forward_prefill(
@@ -721,7 +759,9 @@ class Attention():
             )
         else:
             return self.forward_decode(
-                x, current_pos, rot_mats, page_table=page_table, kv_cache=kv_cache, kv_slice=kv_slice,
+                x, current_pos, rot_mats,
+                page_table=page_table, kv_cache=kv_cache,
+                kv_slice=kv_slice, dram_model=dram_model,
             )
 
 

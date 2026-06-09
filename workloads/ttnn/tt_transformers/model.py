@@ -131,6 +131,7 @@ class Transformer():
         get_last_token=-1,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
         ):
         for i, layer in enumerate(self.layers):
             x = layer(
@@ -144,6 +145,7 @@ class Transformer():
                 chunk_start_idx=chunk_start_idx,
                 kv_cache=kv_cache[i] if kv_cache is not None else None,
                 kv_slice=kv_slice,
+                dram_model=dram_model,
             )
 
         if mode == "prefill" and get_last_token == -1:
@@ -179,6 +181,7 @@ class Transformer():
         get_last_token=-1,
         kv_cache=None,
         kv_slice=True,
+        dram_model=True,
         ):
         return self.forward(
             x,
@@ -192,6 +195,7 @@ class Transformer():
             get_last_token=get_last_token,
             kv_cache=kv_cache,
             kv_slice=kv_slice,
+            dram_model=dram_model,
         )
 
     def ttnn_prefill_forward(
